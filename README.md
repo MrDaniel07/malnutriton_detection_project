@@ -1,6 +1,4 @@
-# Early Malnutrition Detection (Prototype)
-
-This workspace contains a small prototype for experimenting with a logistic regression model to detect early malnutrition risk in young children. It is intended as a demo and educational tool — not a clinical system.
+# Early Malnutrition Detection in Children using Logistic Regression
 
 Files added:
 - `app.py` — Streamlit interactive app to train and test the model
