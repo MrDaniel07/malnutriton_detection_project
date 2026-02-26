@@ -9,7 +9,6 @@
     "immunizations",
     "household_income",
     "maternal_education_years",
-    "malnourished",
     "HAZ",
     "WAZ",
     "WHZ"
@@ -24,15 +23,14 @@
     "immunizations": 3.4759333333333333,
     "household_income": 50753.63430900292,
     "maternal_education_years": 7.507666666666666,
-    "malnourished": 0.0154,
     "HAZ": 4.479090788600415,
     "WAZ": 1.4741865465502308,
     "WHZ": -1.036365541023991
   },
   "metrics": {
-    "auc": 1.0,
-    "auc_std": 0.0,
-    "num_features": 13,
+    "auc": 0.6901602674857401,
+    "auc_std": 0.052929707945450745,
+    "num_features": 12,
     "training_samples": 15000
   }
 }

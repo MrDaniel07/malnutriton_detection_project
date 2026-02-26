@@ -214,8 +214,8 @@ def train_model():
         C = request.json.get('C', 1.0)
         cv_folds = request.json.get('cv_folds', 5)
         
-        # Get numeric features
-        feature_cols = get_numeric_columns(df, exclude_cols=['any_mal'])
+        # Get numeric features (exclude label columns)
+        feature_cols = get_numeric_columns(df, exclude_cols=['any_mal', 'malnourished'])
         
         if not feature_cols:
             return jsonify({'status': 'error', 'message': 'No numeric features found'}), 400
@@ -279,12 +279,19 @@ def predict():
         if defaults is None and model_state['training_data'] is not None:
             defaults = build_feature_defaults(model_state['training_data'], feature_cols)
             model_state['feature_defaults'] = defaults
-
+        
+        print(f"DEBUG - Feature columns: {feature_cols}")
+        print(f"DEBUG - Patient data received: {patient_data}")
+        print(f"DEBUG - Defaults (sample): {list(defaults.items())[:5] if defaults else 'None'}")
+        
         filled_data = dict(defaults or {})
         filled_data.update(patient_data)
-
+        
+        print(f"DEBUG - Filled data (items): {[(k, filled_data[k]) for k in list(filled_data.keys())[:8]]}")
+        
         pred = predict_single(model_state['model'], feature_cols, filled_data)
         prob = pred['probability']
+        print(f"DEBUG - Predicted probability: {prob}")
         
         # Determine risk level and feedback
         if prob > 0.7:

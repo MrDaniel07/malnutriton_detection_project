@@ -42,8 +42,8 @@ def train_and_save():
     print(f"Data prepared: {len(df)} rows, {len(df.columns)} columns")
     print(f"Malnutrition cases: {df['any_mal'].sum()} ({df['any_mal'].sum()/len(df)*100:.1f}%)")
     
-    # Get features
-    feature_cols = get_numeric_columns(df, exclude_cols=['any_mal'])
+    # Get features (exclude label columns)
+    feature_cols = get_numeric_columns(df, exclude_cols=['any_mal', 'malnourished'])
     print(f"Training with {len(feature_cols)} features")
     
     # Train model with 5-fold cross-validation
