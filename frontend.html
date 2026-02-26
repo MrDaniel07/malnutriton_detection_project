@@ -688,22 +688,7 @@
             useEffect(() => {
                 const initializeModel = async () => {
                     try {
-                        // First check if model is already loaded
-                        setTrainingMessage('Checking model status...');
-                        const modelInfoRes = await fetch(`${API_BASE}/model-info`);
-
-                        if (modelInfoRes.ok) {
-                            // Model already loaded, skip training
-                            setTrainingMessage('Model ready. Loading assessment...');
-                            setTimeout(() => {
-                                setLoading(false);
-                                setTrainingMessage('');
-                                makePrediction(age, weight, height, muac);
-                            }, 500);
-                            return;
-                        }
-
-                        // Model not loaded, need to load data and train
+                        // Always train fresh model
                         setTrainingMessage('Loading training data...');
 
                         // Load data
