@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: malnutrition-api
+    env: python
+    plan: free
+    runtime: python-3.11
+    buildCommand: pip install flask flask-cors scikit-learn pandas numpy joblib matplotlib seaborn
+    startCommand: python ml_api.py
+    autoDeploy: true
+    envVars:
+      - key: PYTHONUNBUFFERED
+        value: '1'
