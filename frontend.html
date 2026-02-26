@@ -1,1347 +1,456 @@
-<!DOCTYPE html>
-<html lang="en">
+"""
+Flask API for Early Malnutrition Detection Model
+Serves predictions and provides model metadata
+"""
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+import pandas as pd
+import numpy as np
+from models import train_evaluate, cross_validated_train, get_numeric_columns, predict_single
+from data_utils import load_csv
+import joblib
+import os
 
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Malnutrition Risk Assessment - Clinical Tool</title>
-    <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
-    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
-    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
-    <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
+app = Flask(__name__)
+CORS(app)  # Enable CORS for React frontend
+
+# Global model state
+model_state = {
+    'model': None,
+    'feature_cols': None,
+    'metrics': None,
+    'training_data': None,
+    'feature_defaults': None
+}
+
+
+def build_feature_defaults(df, feature_cols):
+    """Build default feature values from training data means."""
+    defaults = {}
+    for col in feature_cols:
+        try:
+            defaults[col] = float(df[col].mean())
+        except Exception:
+            defaults[col] = 0.0
+    return defaults
+
+
+def compute_z_scores(age_months, weight_kg, height_cm):
+    """
+    Compute approximate z-scores from raw anthropometric measurements.
+    Uses simplified linear models based on WHO West Africa reference values.
+    
+    WHO reference (60 months): 115cm height, 20kg weight, 17cm MUAC
+    
+    Note: This is a simplified approximation. For production use, implement
+    proper WHO reference table lookups with age/sex stratification.
+    """
+    # Expected values based on age (linear approximation)
+    # Calibrated to WHO West Africa standards
+    expected_height = 48 + (age_months * 1.12)  # ~115cm at 60 months
+    expected_weight = 3 + (age_months * 0.28)   # ~20kg at 60 months
+    
+    # Standard deviations (approximated from WHO growth charts)
+    sd_height = 6.0
+    sd_weight = 2.5
+    
+    # Height-for-Age Z-score (HAZ) - indicates stunting
+    HAZ = (height_cm - expected_height) / sd_height
+    
+    # Weight-for-Age Z-score (WAZ) - indicates underweight
+    WAZ = (weight_kg - expected_weight) / sd_weight
+    
+    # Weight-for-Height Z-score (WHZ) - indicates wasting
+    # Expected weight for given height (simplified regression)
+    expected_weight_for_height = -15 + (height_cm * 0.3)
+    sd_weight_for_height = 2.0
+    WHZ = (weight_kg - expected_weight_for_height) / sd_weight_for_height
+    
+    return {'WHZ': WHZ, 'HAZ': HAZ, 'WAZ': WAZ}
+
+
+def compose_feedback(risk_level, prob):
+    pct = prob * 100
+    if risk_level == 'HIGH':
+        return (
+            f"High malnutrition risk detected ({pct:.1f}%). "
+            "Recommend immediate clinical assessment with a qualified provider, "
+            "including anthropometry verification, dietary history, and infection screening. "
+            "If severe wasting is suspected, consider referral for urgent nutrition support."
+        )
+    if risk_level == 'MODERATE':
+        return (
+            f"Moderate malnutrition risk detected ({pct:.1f}%). "
+            "Recommend follow-up screening within 2-4 weeks, nutrition counseling for caregivers, "
+            "and monitoring of weight gain and MUAC trends. "
+            "Assess for recent illness that could affect growth." 
+        )
+    return (
+        f"Low malnutrition risk detected ({pct:.1f}%). "
+        "Continue routine growth monitoring and ensure balanced feeding practices. "
+        "If symptoms develop or growth stalls, schedule a follow-up assessment."
+    )
+
+
+@app.route('/api/health', methods=['GET'])
+def health():
+    """Health check endpoint."""
+    return jsonify({'status': 'ok', 'service': 'malnutrition-detection-api'})
+
+
+@app.route('/api/load-data', methods=['POST'])
+def load_data():
+    """Load training data (synthetic CSV or generate on-the-fly)."""
+    try:
+        data_source = request.json.get('source', 'synthetic')
+        
+        if data_source == 'synthetic':
+            # Try loading CSV first, fallback to generating synthetic data
+            try:
+                df = load_csv('csv_output/large_synthetic.csv')
+            except FileNotFoundError:
+                # Generate synthetic data if CSV doesn't exist (useful for cloud deployment)
+                print("CSV not found, generating synthetic data with 15000 samples...")
+                from data_utils import generate_synthetic_data
+                df = generate_synthetic_data(n_samples=15000, random_state=42)
+                
+                # Add z-scores using compute_z_scores helper
+                z_scores_list = []
+                for _, row in df.iterrows():
+                    z = compute_z_scores(row['age_months'], row['weight_kg'], row['height_cm'])
+                    z_scores_list.append(z)
+                z_df = pd.DataFrame(z_scores_list)
+                df = pd.concat([df, z_df], axis=1)
+            
+            # Compute any_mal if not present
+            if 'any_mal' not in df.columns and all(c in df.columns for c in ['WHZ', 'HAZ', 'WAZ']):
+                df['any_mal'] = ((df['WHZ'] < -2) | (df['HAZ'] < -2) | (df['WAZ'] < -2)).astype(int)
+            
+            model_state['training_data'] = df
+            
+            return jsonify({
+                'status': 'success',
+                'rows': len(df),
+                'columns': len(df.columns),
+                'malnutrition_cases': int(df['any_mal'].sum()) if 'any_mal' in df.columns else 0
+            })
+        else:
+            return jsonify({'status': 'error', 'message': 'Invalid data source'}), 400
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+
+@app.route('/api/train', methods=['POST'])
+def train_model():
+    """Train logistic regression model."""
+    try:
+        if model_state['training_data'] is None:
+            return jsonify({'status': 'error', 'message': 'No data loaded. Call /api/load-data first'}), 400
+        
+        df = model_state['training_data']
+        C = request.json.get('C', 1.0)
+        cv_folds = request.json.get('cv_folds', 5)
+        
+        # Get numeric features
+        feature_cols = get_numeric_columns(df, exclude_cols=['any_mal'])
+        
+        if not feature_cols:
+            return jsonify({'status': 'error', 'message': 'No numeric features found'}), 400
+        
+        # Train with cross-validation
+        cv_res = cross_validated_train(
+            df, 
+            feature_cols=feature_cols,
+            target_col='any_mal',
+            C=C, 
+            cv=cv_folds,
+            random_state=42
+        )
+        
+        model_state['model'] = cv_res['model']
+        model_state['feature_cols'] = feature_cols
+        model_state['feature_defaults'] = build_feature_defaults(df, feature_cols)
+        model_state['metrics'] = {
+            'auc': float(cv_res['cv_auc_mean']),
+            'auc_std': float(cv_res['cv_auc_std']),
+            'num_features': len(feature_cols),
+            'training_samples': len(df)
         }
+        
+        return jsonify({
+            'status': 'success',
+            'message': 'Model trained successfully',
+            'metrics': model_state['metrics'],
+            'features': feature_cols
+        })
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
 
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Helvetica Neue', sans-serif;
-            background: linear-gradient(135deg, #f5f7fa 0%, #e6eef5 100%);
-            min-height: 100vh;
-            padding: 16px;
-        }
 
-        .container {
-            max-width: 1600px;
-            margin: 0 auto;
-            background: white;
-            border-radius: 20px;
-            box-shadow: 0 12px 40px rgba(0, 0, 0, 0.08);
-            overflow: hidden;
-            animation: fadeIn 0.6s ease-out;
-        }
+@app.route('/api/predict', methods=['POST'])
+def predict():
+    """Make prediction for a single child."""
+    try:
+        if model_state['model'] is None:
+            return jsonify({'status': 'error', 'message': 'Model not trained. Call /api/train first'}), 400
+        
+        patient_data = request.json.get('patient_data', {})
+        
+        # Validate required inputs
+        if not patient_data:
+            return jsonify({'status': 'error', 'message': 'No patient data provided'}), 400
+        
+        # Compute z-scores from raw measurements if available
+        age = patient_data.get('age_months')
+        weight = patient_data.get('weight_kg')
+        height = patient_data.get('height_cm')
+        
+        if age and weight and height:
+            z_scores = compute_z_scores(age, weight, height)
+            # Add computed z-scores to patient data
+            patient_data.update(z_scores)
+        
+        # Make prediction
+        feature_cols = model_state['feature_cols']
+        defaults = model_state.get('feature_defaults')
+        if defaults is None and model_state['training_data'] is not None:
+            defaults = build_feature_defaults(model_state['training_data'], feature_cols)
+            model_state['feature_defaults'] = defaults
 
-        @keyframes fadeIn {
-            from {
-                opacity: 0;
-                transform: translateY(10px);
+        filled_data = dict(defaults or {})
+        filled_data.update(patient_data)
+
+        pred = predict_single(model_state['model'], feature_cols, filled_data)
+        prob = pred['probability']
+        
+        # Determine risk level and feedback
+        if prob > 0.7:
+            risk_level = 'HIGH'
+            risk_color = 'red'
+        elif prob > 0.3:
+            risk_level = 'MODERATE'
+            risk_color = 'yellow'
+        else:
+            risk_level = 'LOW'
+            risk_color = 'green'
+        
+        feedback = compose_feedback(risk_level, prob)
+        
+        # Get current model AUC
+        model_auc = model_state.get('metrics', {}).get('auc', None)
+        
+        return jsonify({
+            'status': 'success',
+            'probability': float(prob),
+            'percentage': f'{prob*100:.1f}%',
+            'risk_level': risk_level,
+            'risk_color': risk_color,
+            'feedback': feedback,
+            'model_auc': model_auc,
+            'patient_data': patient_data
+        })
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+
+@app.route('/api/model-info', methods=['GET'])
+def model_info():
+    """Get current model information and feature list."""
+    if model_state['model'] is None:
+        return jsonify({'status': 'error', 'message': 'No model trained'}), 400
+    
+    return jsonify({
+        'status': 'success',
+        'metrics': model_state['metrics'],
+        'features': model_state['feature_cols'],
+        'model_type': 'Logistic Regression with Balanced Class Weights'
+    })
+
+
+@app.route('/api/feature-stats', methods=['GET'])
+def feature_stats():
+    """Get statistics for all features (for setting UI slider ranges)."""
+    if model_state['training_data'] is None:
+        return jsonify({'status': 'error', 'message': 'No data loaded'}), 400
+    
+    df = model_state['training_data']
+    feature_cols = model_state.get('feature_cols', get_numeric_columns(df, exclude_cols=['any_mal']))
+    
+    stats = {}
+    for feat in feature_cols:
+        try:
+            stats[feat] = {
+                'min': float(df[feat].min()),
+                'max': float(df[feat].max()),
+                'mean': float(df[feat].mean()),
+                'median': float(df[feat].median()),
+                'std': float(df[feat].std())
             }
-
-            to {
-                opacity: 1;
-                transform: translateY(0);
-            }
-        }
-
-        .header {
-            background: linear-gradient(135deg, #1e3a8a 0%, #2563eb 50%, #0ea5e9 100%);
-            color: white;
-            padding: 52px 40px;
-            text-align: center;
-            position: relative;
-            overflow: hidden;
-        }
-
-        .header::before {
-            content: '';
-            position: absolute;
-            top: -50%;
-            right: -10%;
-            width: 500px;
-            height: 500px;
-            background: rgba(255, 255, 255, 0.08);
-            border-radius: 50%;
-            animation: float 6s ease-in-out infinite;
-        }
-
-        @keyframes float {
-
-            0%,
-            100% {
-                transform: translateY(0);
-            }
-
-            50% {
-                transform: translateY(20px);
-            }
-        }
-
-        .header-content {
-            position: relative;
-            z-index: 1;
-        }
-
-        .header h1 {
-            font-size: 2.8em;
-            margin-bottom: 12px;
-            font-weight: 700;
-            letter-spacing: -0.5px;
-        }
-
-        .header p {
-            font-size: 1.05em;
-            opacity: 0.95;
-            max-width: 600px;
-            margin: 0 auto;
-        }
-
-        .content {
-            display: grid;
-            grid-template-columns: 1fr 1fr 1fr;
-            gap: 32px;
-            padding: 40px;
-        }
-
-        .section {
-            display: flex;
-            flex-direction: column;
-        }
-
-        .section h2 {
-            font-size: 1.5em;
-            color: #1e3a8a;
-            margin-bottom: 24px;
-            font-weight: 700;
-            display: flex;
-            align-items: center;
-            gap: 10px;
-        }
-
-        .input-group {
-            margin-bottom: 28px;
-            animation: slideIn 0.4s ease-out;
-        }
-
-        @keyframes slideIn {
-            from {
-                opacity: 0;
-                transform: translateX(-10px);
-            }
-
-            to {
-                opacity: 1;
-                transform: translateX(0);
-            }
-        }
-
-        .input-group label {
-            display: block;
-            font-weight: 600;
-            color: #1e3a8a;
-            margin-bottom: 10px;
-            font-size: 0.95em;
-        }
-
-        .input-group input[type="range"] {
-            width: 100%;
-            height: 6px;
-            border-radius: 5px;
-            background: linear-gradient(90deg, #e0e7ff 0%, #bfdbfe 100%);
-            outline: none;
-            -webkit-appearance: none;
-            appearance: none;
-            cursor: pointer;
-        }
-
-        .input-group input[type="range"]::-webkit-slider-thumb {
-            -webkit-appearance: none;
-            appearance: none;
-            width: 24px;
-            height: 24px;
-            border-radius: 50%;
-            background: linear-gradient(135deg, #2563eb 0%, #0ea5e9 100%);
-            cursor: pointer;
-            box-shadow: 0 2px 8px rgba(37, 99, 235, 0.4);
-            transition: all 0.2s ease;
-            border: 3px solid white;
-        }
-
-        .input-group input[type="range"]::-webkit-slider-thumb:hover {
-            transform: scale(1.2);
-            box-shadow: 0 4px 12px rgba(37, 99, 235, 0.6);
-        }
-
-        .input-group input[type="range"]::-moz-range-thumb {
-            width: 24px;
-            height: 24px;
-            border-radius: 50%;
-            background: linear-gradient(135deg, #2563eb 0%, #0ea5e9 100%);
-            cursor: pointer;
-            border: 3px solid white;
-            box-shadow: 0 2px 8px rgba(37, 99, 235, 0.4);
-            transition: all 0.2s ease;
-        }
-
-        .value-display {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin-top: 8px;
-            font-size: 0.85em;
-            color: #64748b;
-        }
-
-        .value-display .value {
-            background: linear-gradient(135deg, #dbeafe 0%, #e0f2fe 100%);
-            padding: 6px 14px;
-            border-radius: 20px;
-            font-weight: 700;
-            color: #0369a1;
-            min-width: 70px;
-            text-align: center;
-            border: 1px solid #bae6fd;
-        }
-
-        .file-upload-section {
-            background: linear-gradient(135deg, #f0f9ff 0%, #e0f2fe 100%);
-            padding: 20px;
-            border-radius: 12px;
-            border: 2px dashed #2563eb;
-            text-align: center;
-            margin-bottom: 20px;
-            cursor: pointer;
-            transition: all 0.3s ease;
-        }
-
-        .file-upload-section:hover {
-            background: linear-gradient(135deg, #e0f2fe 0%, #cffafe 100%);
-            border-color: #0ea5e9;
-            transform: translateY(-2px);
-        }
-
-        .file-upload-section input[type="file"] {
-            display: none;
-        }
-
-        .file-upload-label {
-            cursor: pointer;
-            color: #0369a1;
-            font-weight: 600;
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            gap: 8px;
-            font-size: 0.9em;
-        }
-
-        .file-upload-label:hover {
-            color: #0c4a6e;
-        }
-
-        #bodyVisualization {
-            margin-top: 20px;
-            text-align: center;
-            display: flex;
-            justify-content: center;
-            align-items: center;
-        }
-
-        #bodyVisualization svg {
-            max-width: 100%;
-            height: auto;
-            filter: drop-shadow(0 4px 6px rgba(30, 58, 138, 0.1));
-            transform: scale(4);
-            transform-origin: center top;
-            animation: scaleIn 0.5s ease-out;
-        }
-
-        @keyframes scaleIn {
-            from {
-                opacity: 0;
-                transform: scale(3.6);
-            }
-
-            to {
-                opacity: 1;
-                transform: scale(4);
-            }
-        }
-
-        .measurement-label {
-            font-size: 11px;
-            font-weight: 700;
-            fill: #0369a1;
-        }
-
-        .growth-indicator {
-            margin-top: 16px;
-            padding: 12px;
-            border-radius: 8px;
-            text-align: center;
-            font-weight: 600;
-            font-size: 0.9em;
-            animation: slideIn 0.4s ease-out;
-        }
-
-        .growth-indicator.normal {
-            background: linear-gradient(135deg, #d1fae5 0%, #a7f3d0 100%);
-            color: #065f46;
-            border: 1px solid #6ee7b7;
-        }
-
-        .growth-indicator.monitor {
-            background: linear-gradient(135deg, #fed7aa 0%, #fdba74 100%);
-            color: #92400e;
-            border: 1px solid #fb923c;
-        }
-
-        .growth-indicator.deficit {
-            background: linear-gradient(135deg, #fee2e2 0%, #fecaca 100%);
-            color: #7f1d1d;
-            border: 1px solid #f87171;
-        }
-
-        .risk-badge {
-            display: inline-block;
-            padding: 12px 24px;
-            border-radius: 50px;
-            font-weight: 700;
-            font-size: 1.1em;
-            margin-bottom: 20px;
-            text-transform: uppercase;
-            letter-spacing: 1.2px;
-            animation: pulse-badge 0.5s ease-out;
-            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
-        }
-
-        @keyframes pulse-badge {
-            from {
-                opacity: 0;
-                transform: scale(0.9);
-            }
-
-            to {
-                opacity: 1;
-                transform: scale(1);
-            }
-        }
-
-        .risk-badge.high {
-            background: linear-gradient(135deg, #ef4444 0%, #dc2626 100%);
-            color: white;
-        }
-
-        .risk-badge.moderate {
-            background: linear-gradient(135deg, #f59e0b 0%, #d97706 100%);
-            color: white;
-        }
-
-        .risk-badge.low {
-            background: linear-gradient(135deg, #10b981 0%, #059669 100%);
-            color: white;
-        }
-
-        .probability {
-            font-size: 3em;
-            font-weight: 700;
-            background: linear-gradient(135deg, #2563eb 0%, #0ea5e9 100%);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-            background-clip: text;
-            margin: 20px 0;
-            animation: countUp 0.8s ease-out;
-        }
-
-        @keyframes countUp {
-            from {
-                opacity: 0;
-                transform: translateY(10px);
-            }
-
-            to {
-                opacity: 1;
-                transform: translateY(0);
-            }
-        }
-
-        .progress-bar {
-            width: 100%;
-            height: 8px;
-            background: #e2e8f0;
-            border-radius: 10px;
-            overflow: hidden;
-            margin: 24px 0;
-            position: relative;
-        }
-
-        .progress-fill {
-            height: 100%;
-            background: linear-gradient(90deg, #2563eb 0%, #0ea5e9 100%);
-            border-radius: 10px;
-            transition: width 0.5s ease;
-            position: relative;
-            box-shadow: 0 0 10px rgba(37, 99, 235, 0.4);
-        }
-
-        .progress-fill::after {
-            content: '';
-            position: absolute;
-            top: 0;
-            left: 0;
-            right: 0;
-            bottom: 0;
-            background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.3), transparent);
-            animation: shimmer 2s infinite;
-        }
-
-        @keyframes shimmer {
-            0% {
-                transform: translateX(-100%);
-            }
-
-            100% {
-                transform: translateX(100%);
-            }
-        }
-
-        .feedback {
-            background: linear-gradient(135deg, #f8fafc 0%, #f1f5f9 100%);
-            padding: 18px;
-            border-radius: 12px;
-            line-height: 1.7;
-            color: #334155;
-            font-size: 0.95em;
-            margin-top: 20px;
-            border-left: 5px solid #2563eb;
-            animation: fadeInUp 0.5s ease-out 0.2s both;
-        }
-
-        @keyframes fadeInUp {
-            from {
-                opacity: 0;
-                transform: translateY(10px);
-            }
-
-            to {
-                opacity: 1;
-                transform: translateY(0);
-            }
-        }
-
-        #loading {
-            text-align: center;
-            padding: 80px 40px;
-            font-size: 1.2em;
-            color: #2563eb;
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            gap: 20px;
-        }
-
-        .loading-spinner {
-            width: 50px;
-            height: 50px;
-            border: 4px solid #dbeafe;
-            border-top-color: #2563eb;
-            border-radius: 50%;
-            animation: spin 1s linear infinite;
-        }
-
-        @keyframes spin {
-            to {
-                transform: rotate(360deg);
-            }
-        }
-
-        .error-message {
-            background: linear-gradient(135deg, #fee2e2 0%, #fecaca 100%);
-            border: 2px solid #ef4444;
-            color: #991b1b;
-            padding: 20px;
-            border-radius: 12px;
-            margin: 40px;
-        }
-
-        .training-status {
-            background: linear-gradient(135deg, #dbeafe 0%, #bae6fd 100%);
-            padding: 16px;
-            border-radius: 10px;
-            color: #0c4a6e;
-            margin-bottom: 20px;
-            border-left: 4px solid #0369a1;
-            font-weight: 500;
-            animation: slideIn 0.4s ease-out;
-        }
-
-        .batch-results {
-            margin: 20px 40px 40px;
-            background: linear-gradient(135deg, #f8fafc 0%, #eef2ff 100%);
-            border: 1px solid #e2e8f0;
-            border-radius: 16px;
-            padding: 20px;
-            box-shadow: 0 10px 24px rgba(15, 23, 42, 0.06);
-        }
-
-        .batch-summary {
-            display: flex;
-            gap: 12px;
-            flex-wrap: wrap;
-            margin: 12px 0 16px;
-        }
-
-        .batch-stat {
-            background: white;
-            border: 1px solid #e2e8f0;
-            padding: 8px 12px;
-            border-radius: 10px;
-            font-weight: 600;
-            color: #0f172a;
-            font-size: 0.9em;
-        }
-
-        .batch-table-wrapper {
-            overflow-x: auto;
-        }
-
-        .batch-table {
-            width: 100%;
-            border-collapse: collapse;
-            font-size: 0.9em;
-            min-width: 720px;
-        }
-
-        .batch-table th,
-        .batch-table td {
-            padding: 10px 12px;
-            border-bottom: 1px solid #e2e8f0;
-            text-align: left;
-            color: #0f172a;
-        }
-
-        .batch-table th {
-            background: #e2e8f0;
-            color: #1e293b;
-            font-weight: 700;
-            position: sticky;
-            top: 0;
-            z-index: 1;
-        }
-
-        .risk-pill {
-            display: inline-block;
-            padding: 4px 10px;
-            border-radius: 999px;
-            font-weight: 700;
-            font-size: 0.75em;
-            letter-spacing: 0.6px;
-            text-transform: uppercase;
-        }
-
-        .risk-pill.low {
-            background: #dcfce7;
-            color: #166534;
-        }
-
-        .risk-pill.moderate {
-            background: #ffedd5;
-            color: #9a3412;
-        }
-
-        .risk-pill.high {
-            background: #fee2e2;
-            color: #991b1b;
-        }
-
-        .action-button {
-            appearance: none;
-            border: none;
-            background: linear-gradient(135deg, #1e3a8a 0%, #2563eb 60%, #0ea5e9 100%);
-            color: white;
-            font-weight: 700;
-            font-size: 0.95em;
-            padding: 12px 18px;
-            border-radius: 12px;
-            cursor: pointer;
-            display: inline-flex;
-            align-items: center;
-            justify-content: center;
-            gap: 8px;
-            box-shadow: 0 8px 20px rgba(37, 99, 235, 0.25);
-            transition: transform 0.2s ease, box-shadow 0.2s ease, opacity 0.2s ease;
-            width: 100%;
-        }
-
-        .action-button:hover {
-            transform: translateY(-1px);
-            box-shadow: 0 10px 24px rgba(37, 99, 235, 0.35);
-        }
-
-        .action-button:disabled {
-            cursor: not-allowed;
-            opacity: 0.7;
-            transform: none;
-            box-shadow: none;
-        }
-
-        .assessment-status {
-            margin-top: 20px;
-            padding: 18px;
-            border-radius: 14px;
-            background: linear-gradient(135deg, #eef2ff 0%, #e0f2fe 100%);
-            border: 1px solid #c7d2fe;
-            color: #1e3a8a;
-            display: flex;
-            flex-direction: column;
-            gap: 10px;
-            animation: fadeInUp 0.4s ease-out;
-        }
-
-        .assessment-row {
-            display: flex;
-            align-items: center;
-            gap: 12px;
-            font-size: 0.95em;
-            font-weight: 600;
-        }
-
-        .assessment-steps {
-            font-size: 0.85em;
-            color: #475569;
-            line-height: 1.6;
-            display: grid;
-            gap: 6px;
-        }
-
-        .step-active {
-            color: #1d4ed8;
-            font-weight: 600;
-        }
-
-        .step-muted {
-            opacity: 0.6;
-        }
-
-        @media (max-width: 1200px) {
-            .content {
-                grid-template-columns: 1fr 1fr;
-                gap: 24px;
-                padding: 32px;
-            }
-        }
-
-        @media (max-width: 768px) {
-            .content {
-                grid-template-columns: 1fr;
-                gap: 28px;
-            }
-
-            .header h1 {
-                font-size: 1.8em;
-            }
-
-            .header p {
-                font-size: 0.95em;
-            }
-        }
-    </style>
-</head>
-
-<body>
-    <div id="root"></div>
-
-    <script type="text/babel">
-        const { useState, useEffect, useRef } = React;
-
-        const API_BASE = 'https://malnutriton-api-1.onrender.com/api';
-
-        function App() {
-            const [age, setAge] = useState(24);
-            const [weight, setWeight] = useState(12);
-            const [height, setHeight] = useState(85);
-            const [muac, setMuac] = useState(14);
-            const [prediction, setPrediction] = useState(null);
-            const [loading, setLoading] = useState(true);
-            const [error, setError] = useState(null);
-            const [trainingMessage, setTrainingMessage] = useState('');
-            const [isEvaluating, setIsEvaluating] = useState(false);
-            const [assessmentStepIndex, setAssessmentStepIndex] = useState(0);
-            const [needsRecheck, setNeedsRecheck] = useState(false);
-            const [assessmentError, setAssessmentError] = useState('');
-            const [batchResults, setBatchResults] = useState([]);
-            const [batchSummary, setBatchSummary] = useState(null);
-            const [batchAuc, setBatchAuc] = useState(null);
-            const [batchMessage, setBatchMessage] = useState('');
-            const [batchError, setBatchError] = useState('');
-            const [isBatchLoading, setIsBatchLoading] = useState(false);
-            const batchFileInputRef = useRef(null);
-
-            const assessmentSteps = [
-                'Collecting patient measurements',
-                'Comparing patient data with WHO WAF growth standards',
-                'Computing growth deviation signals and risk probability',
-                'Generating clinical guidance and risk summary'
-            ];
-
-            // Initialize and train model on load
-            useEffect(() => {
-                const initializeModel = async () => {
-                    try {
-                        setTrainingMessage('Loading training data...');
-
-                        // Load data
-                        const loadRes = await fetch(`${API_BASE}/load-data`, {
-                            method: 'POST',
-                            headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({ source: 'synthetic' })
-                        });
-
-                        if (!loadRes.ok) throw new Error('Failed to load data');
-
-                        setTrainingMessage('Training model with 5-fold cross-validation...');
-
-                        // Train model
-                        const trainRes = await fetch(`${API_BASE}/train`, {
-                            method: 'POST',
-                            headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({ C: 1.0, cv_folds: 5 })
-                        });
-
-                        if (!trainRes.ok) throw new Error('Failed to train model');
-
-                        setTrainingMessage('Model trained successfully. Ready for assessment...');
-
-                        setTimeout(() => {
-                            setLoading(false);
-                            setTrainingMessage('');
-                            makePrediction(age, weight, height, muac);
-                        }, 800);
-                    } catch (err) {
-                        setError(err.message);
-                        setLoading(false);
-                    }
-                };
-
-                initializeModel();
-            }, []);
-
-            const makePrediction = async (a, w, h, m) => {
-                try {
-                    const payload = {
-                        patient_data: {
-                            age_months: a,
-                            weight_kg: w,
-                            height_cm: h,
-                            muac_cm: m,
-                            HH1: 50,
-                            HH2: 45
-                        }
-                    };
-                    setAssessmentError('');
-
-                    const res = await fetch(`${API_BASE}/predict`, {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify(payload)
-                    });
-
-                    const data = await res.json();
-                    if (data.status === 'success') {
-                        setPrediction(data);
-                    } else {
-                        setAssessmentError(data.message || 'Prediction failed. Please retry.');
-                    }
-                } catch (err) {
-                    console.error('Prediction error:', err);
-                    setAssessmentError('Prediction failed. Check API connection and model status.');
+        except:
+            pass
+    
+    return jsonify({'status': 'success', 'statistics': stats})
+
+
+@app.route('/api/save-model', methods=['POST'])
+def save_model():
+    """Save trained model to disk."""
+    try:
+        if model_state['model'] is None:
+            return jsonify({'status': 'error', 'message': 'No model to save'}), 400
+        
+        path_prefix = request.json.get('path', 'models/malnutrition_model')
+        model_path = f"{path_prefix}.joblib"
+        
+        os.makedirs(os.path.dirname(model_path) or '.', exist_ok=True)
+        joblib.dump(model_state['model'], model_path)
+        
+        return jsonify({
+            'status': 'success',
+            'model_path': model_path,
+            'message': f'Model saved to {model_path}'
+        })
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+
+@app.route('/api/predict-csv', methods=['POST'])
+def predict_csv():
+    """Predict malnutrition risk for multiple patient records in a CSV file."""
+    try:
+        if model_state['model'] is None:
+            return jsonify({'status': 'error', 'message': 'Model not trained. Call /api/train first'}), 400
+
+        if 'file' not in request.files:
+            return jsonify({'status': 'error', 'message': 'No file uploaded'}), 400
+
+        file = request.files['file']
+
+        if file.filename == '':
+            return jsonify({'status': 'error', 'message': 'No file selected'}), 400
+
+        if not file.filename.endswith('.csv'):
+            return jsonify({'status': 'error', 'message': 'File must be CSV format'}), 400
+
+        try:
+            df = pd.read_csv(file)
+        except Exception as e:
+            return jsonify({'status': 'error', 'message': f'Failed to read CSV: {str(e)}'}), 400
+
+        if len(df) == 0:
+            return jsonify({'status': 'error', 'message': 'CSV file is empty'}), 400
+
+        feature_cols = model_state['feature_cols']
+        defaults = model_state.get('feature_defaults') or {}
+
+        results = []
+        summary_counts = {'HIGH': 0, 'MODERATE': 0, 'LOW': 0}
+
+        column_lookup = {str(col).lower(): col for col in df.columns}
+
+        def pick_value(row, names):
+            for name in names:
+                col = column_lookup.get(str(name).lower())
+                if col is None:
+                    col = name
+                if col in row and pd.notna(row[col]):
+                    return row[col]
+            return None
+
+        def to_float(value):
+            try:
+                return float(value)
+            except Exception:
+                return None
+
+        for idx, row in df.iterrows():
+            row_data = {}
+            for col in feature_cols:
+                if col in row and pd.notna(row[col]):
+                    try:
+                        row_data[col] = float(row[col])
+                    except Exception:
+                        continue
+
+            age = row_data.get('age_months')
+            if age is None:
+                age = to_float(pick_value(row, ['age_months', 'age']))
+                if age is not None:
+                    row_data['age_months'] = age
+
+            weight = row_data.get('weight_kg')
+            if weight is None:
+                weight = to_float(pick_value(row, ['weight_kg', 'weight']))
+                if weight is not None:
+                    row_data['weight_kg'] = weight
+
+            height = row_data.get('height_cm')
+            if height is None:
+                height = to_float(pick_value(row, ['height_cm', 'height']))
+                if height is not None:
+                    row_data['height_cm'] = height
+
+            muac = row_data.get('muac_cm')
+            if muac is None:
+                muac = to_float(pick_value(row, ['muac_cm', 'muac']))
+                if muac is not None:
+                    row_data['muac_cm'] = muac
+
+            if age is not None and weight is not None and height is not None:
+                if any(col not in row_data for col in ['WHZ', 'HAZ', 'WAZ']):
+                    z_scores = compute_z_scores(age, weight, height)
+                    row_data.update(z_scores)
+
+            filled_data = dict(defaults)
+            filled_data.update(row_data)
+
+            pred = predict_single(model_state['model'], feature_cols, filled_data)
+            prob = float(pred['probability'])
+
+            if prob > 0.7:
+                risk_level = 'HIGH'
+                risk_color = 'red'
+            elif prob > 0.3:
+                risk_level = 'MODERATE'
+                risk_color = 'yellow'
+            else:
+                risk_level = 'LOW'
+                risk_color = 'green'
+
+            summary_counts[risk_level] += 1
+
+            results.append({
+                'row': int(idx) + 1,
+                'probability': prob,
+                'percentage': f'{prob * 100:.1f}%',
+                'risk_level': risk_level,
+                'risk_color': risk_color,
+                'inputs': {
+                    'age_months': age,
+                    'weight_kg': weight,
+                    'height_cm': height,
+                    'muac_cm': muac,
+                    'WHZ': row_data.get('WHZ'),
+                    'HAZ': row_data.get('HAZ'),
+                    'WAZ': row_data.get('WAZ')
                 }
-            };
+            })
 
-            const formatOptional = (value, digits = 1) => {
-                if (value === null || value === undefined || Number.isNaN(value)) return '-';
-                const num = Number(value);
-                return Number.isNaN(num) ? '-' : num.toFixed(digits);
-            };
-
-            const handleBatchPredictUpload = async (e) => {
-                const file = e.target.files?.[0];
-                if (!file) return;
-
-                const formData = new FormData();
-                formData.append('file', file);
-
-                try {
-                    setBatchError('');
-                    setBatchMessage('Uploading CSV for batch prediction...');
-                    setIsBatchLoading(true);
-
-                    const res = await fetch(`${API_BASE}/predict-csv`, {
-                        method: 'POST',
-                        body: formData
-                    });
-
-                    const data = await res.json();
-                    if (data.status === 'success') {
-                        setBatchResults(data.results || []);
-                        setBatchSummary(data.summary || null);
-                        setBatchAuc(data.model_auc);
-                        setBatchMessage(`✅ Batch prediction complete: ${data.total} patients`);
-                    } else {
-                        setBatchResults([]);
-                        setBatchSummary(null);
-                        setBatchAuc(null);
-                        setBatchError(data.message || 'Batch prediction failed.');
-                    }
-                } catch (err) {
-                    setBatchResults([]);
-                    setBatchSummary(null);
-                    setBatchAuc(null);
-                    setBatchError(`Batch prediction error: ${err.message}`);
-                } finally {
-                    setIsBatchLoading(false);
-                    if (batchFileInputRef.current) {
-                        batchFileInputRef.current.value = '';
-                    }
-                }
-            };
-
-            const handleSliderChange = (setterFunc, newValue) => {
-                setterFunc(newValue);
-                setNeedsRecheck(true);
-            };
-
-            const runAssessment = async () => {
-                if (isEvaluating) return;
-                setIsEvaluating(true);
-                setAssessmentStepIndex(0);
-                setAssessmentError('');
-
-                try {
-                    for (let i = 0; i < assessmentSteps.length; i += 1) {
-                        setAssessmentStepIndex(i);
-                        // Short delay to communicate each processing step
-                        await new Promise((resolve) => setTimeout(resolve, 450));
-                    }
-
-                    await makePrediction(age, weight, height, muac);
-                    setNeedsRecheck(false);
-                } finally {
-                    setIsEvaluating(false);
-                }
-            };
+        return jsonify({
+            'status': 'success',
+            'total': len(results),
+            'summary': {
+                'high': summary_counts['HIGH'],
+                'moderate': summary_counts['MODERATE'],
+                'low': summary_counts['LOW']
+            },
+            'model_auc': model_state.get('metrics', {}).get('auc', None),
+            'results': results
+        })
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
 
 
-            if (loading) {
-                return (
-                    <div className="container">
-                        <div className="header">
-                            <div className="header-content">
-                                <h1>🏥 Clinical Assessment System</h1>
-                                <p>AI-Powered Malnutrition Risk Detection</p>
-                            </div>
-                        </div>
-                        <div id="loading">
-                            <div className="loading-spinner"></div>
-                            <div>{trainingMessage || 'Initializing system...'}</div>
-                        </div>
-                    </div>
-                );
-            }
-
-            if (error) {
-                return (
-                    <div className="container">
-                        <div className="header">
-                            <div className="header-content">
-                                <h1>🏥 System Error</h1>
-                            </div>
-                        </div>
-                        <div className="error-message">
-                            <strong>Connection Error:</strong> {error}
-                        </div>
-                    </div>
-                );
-            }
-
-            return (
-                <div className="container">
-                    <div className="header">
-                        <div className="header-content">
-                            <h1>🏥 Clinical Assessment System</h1>
-                            <p>AI-Powered Early Malnutrition Detection for West African Children</p>
-                        </div>
-                    </div>
-
-                    {trainingMessage && (
-                        <div style={{ padding: '0 40px', paddingTop: '20px' }}>
-                            <div className="training-status">{trainingMessage}</div>
-                        </div>
-                    )}
-
-                    <div className="content">
-                        {/* Left Column: Input Controls */}
-                        <div className="section">
-                            <h2>📋 Patient Data Entry</h2>
-
-                            <div className="file-upload-section">
-                                <label className="file-upload-label">
-                                    📊 Batch Predict CSV
-                                    <span style={{ fontSize: '0.8em' }}>(Shows prediction for each patient)</span>
-                                    <input
-                                        ref={batchFileInputRef}
-                                        type="file"
-                                        accept=".csv"
-                                        onChange={handleBatchPredictUpload}
-                                    />
-                                </label>
-                            </div>
-
-                            <div className="input-group">
-                                <label>Age (months)</label>
-                                <input
-                                    type="range"
-                                    min="0"
-                                    max="60"
-                                    value={age}
-                                    onChange={(e) => handleSliderChange(setAge, parseFloat(e.target.value))}
-                                />
-                                <div className="value-display">
-                                    <span>0</span>
-                                    <span className="value">{age} months</span>
-                                    <span>60</span>
-                                </div>
-                            </div>
-
-                            <div className="input-group">
-                                <label>Weight (kg)</label>
-                                <input
-                                    type="range"
-                                    min="2"
-                                    max="30"
-                                    step="0.1"
-                                    value={weight}
-                                    onChange={(e) => handleSliderChange(setWeight, parseFloat(e.target.value))}
-                                />
-                                <div className="value-display">
-                                    <span>2</span>
-                                    <span className="value">{weight.toFixed(1)} kg</span>
-                                    <span>30</span>
-                                </div>
-                            </div>
-
-                            <div className="input-group">
-                                <label>Height (cm)</label>
-                                <input
-                                    type="range"
-                                    min="45"
-                                    max="140"
-                                    value={height}
-                                    onChange={(e) => handleSliderChange(setHeight, parseFloat(e.target.value))}
-                                />
-                                <div className="value-display">
-                                    <span>45</span>
-                                    <span className="value">{height} cm</span>
-                                    <span>140</span>
-                                </div>
-                            </div>
-
-                            <div className="input-group">
-                                <label>MUAC - Mid Upper Arm Circumference (cm)</label>
-                                <input
-                                    type="range"
-                                    min="7"
-                                    max="25"
-                                    step="0.1"
-                                    value={muac}
-                                    onChange={(e) => handleSliderChange(setMuac, parseFloat(e.target.value))}
-                                />
-                                <div className="value-display">
-                                    <span>7</span>
-                                    <span className="value">{muac.toFixed(1)} cm</span>
-                                    <span>25</span>
-                                </div>
-                            </div>
-
-                            <button
-                                className="action-button"
-                                onClick={runAssessment}
-                                disabled={isEvaluating}
-                                type="button"
-                            >
-                                {isEvaluating ? 'Revalidating...' : 'Revalidate Patient'}
-                            </button>
-                        </div>
-
-                        {/* Center Column: Dynamic Body Visualization */}
-                        <div className="section">
-                            <h2>👤 Anthropometric Visualization</h2>
-                            <BodyVisualization age={age} weight={weight} height={height} muac={muac} />
-                        </div>
-
-                        {/* Right Column: Risk Assessment */}
-                        <div className="section">
-                            <h2>📊 Risk Assessment Results</h2>
-                            {(isEvaluating || needsRecheck) && (
-                                <div className="assessment-status">
-                                    <div className="assessment-row">
-                                        <div
-                                            className="loading-spinner"
-                                            style={{ width: '28px', height: '28px', borderWidth: '3px' }}
-                                        ></div>
-                                        <div>
-                                            {isEvaluating ? 'Revalidating patient data...' : 'New values detected. Click revalidate.'}
-                                        </div>
-                                    </div>
-                                    <div className="assessment-steps">
-                                        {assessmentSteps.map((step, index) => (
-                                            <div
-                                                key={step}
-                                                className={isEvaluating && index === assessmentStepIndex ? 'step-active' : 'step-muted'}
-                                            >
-                                                {isEvaluating && index === assessmentStepIndex ? '● ' : '○ '} {step}
-                                            </div>
-                                        ))}
-                                    </div>
-                                </div>
-                            )}
-                            {assessmentError && (
-                                <div className="error-message" style={{ margin: '16px 0' }}>
-                                    <strong>Assessment Error:</strong> {assessmentError}
-                                </div>
-                            )}
-                            {prediction && (
-                                <>
-                                    <div className={`risk-badge ${prediction.risk_level.toLowerCase()}`}>
-                                        {prediction.risk_level}
-                                    </div>
-                                    <div className="probability">{(prediction.probability * 100).toFixed(1)}%</div>
-                                    <div className="progress-bar">
-                                        <div
-                                            className="progress-fill"
-                                            style={{ width: `${Math.min(prediction.probability * 100, 100)}%` }}
-                                        ></div>
-                                    </div>
-                                    {prediction.model_auc && (
-                                        <div className="feedback" style={{ marginTop: '12px' }}>
-                                            <strong>Model AUC:</strong> {(prediction.model_auc * 100).toFixed(2)}%
-                                        </div>
-                                    )}
-                                    <div className="feedback">
-                                        <strong>Clinical Assessment:</strong> {prediction.feedback}
-                                    </div>
-                                </>
-                            )}
-                            {!prediction && !assessmentError && !isEvaluating && (
-                                <div className="feedback">
-                                    <strong>No assessment yet.</strong> Adjust sliders and click <strong>Revalidate Patient</strong> to run analysis.
-                                </div>
-                            )}
-                        </div>
-                    </div>
-
-                    {(batchMessage || batchError) && (
-                        <div style={{ padding: '0 40px', paddingBottom: '10px' }}>
-                            {batchMessage && <div className="training-status">{batchMessage}</div>}
-                            {batchError && (
-                                <div className="error-message" style={{ margin: '16px 0' }}>
-                                    <strong>Batch Error:</strong> {batchError}
-                                </div>
-                            )}
-                        </div>
-                    )}
-
-                    {batchResults.length > 0 && (
-                        <div className="batch-results">
-                            <h2>🧾 Batch Prediction Results</h2>
-                            {batchSummary && (
-                                <div className="batch-summary">
-                                    <div className="batch-stat">Total: {batchResults.length}</div>
-                                    <div className="batch-stat">High: {batchSummary.high}</div>
-                                    <div className="batch-stat">Moderate: {batchSummary.moderate}</div>
-                                    <div className="batch-stat">Low: {batchSummary.low}</div>
-                                    {batchAuc && <div className="batch-stat">AUC: {(batchAuc * 100).toFixed(2)}%</div>}
-                                </div>
-                            )}}
-                            {isBatchLoading && (
-                                <div className="assessment-status" style={{ marginTop: '10px' }}>
-                                    <div className="assessment-row">
-                                        <div
-                                            className="loading-spinner"
-                                            style={{ width: '24px', height: '24px', borderWidth: '3px' }}
-                                        ></div>
-                                        <div>Running batch prediction...</div>
-                                    </div>
-                                </div>
-                            )}
-                            <div className="batch-table-wrapper">
-                                <table className="batch-table">
-                                    <thead>
-                                        <tr>
-                                            <th>Row</th>
-                                            <th>Age (mo)</th>
-                                            <th>Weight (kg)</th>
-                                            <th>Height (cm)</th>
-                                            <th>MUAC (cm)</th>
-                                            <th>Risk</th>
-                                            <th>Probability</th>
-                                        </tr>
-                                    </thead>
-                                    <tbody>
-                                        {batchResults.map((item) => (
-                                            <tr key={item.row}>
-                                                <td>{item.row}</td>
-                                                <td>{formatOptional(item.inputs?.age_months, 0)}</td>
-                                                <td>{formatOptional(item.inputs?.weight_kg, 1)}</td>
-                                                <td>{formatOptional(item.inputs?.height_cm, 0)}</td>
-                                                <td>{formatOptional(item.inputs?.muac_cm, 1)}</td>
-                                                <td>
-                                                    <span className={`risk-pill ${item.risk_level?.toLowerCase()}`}>
-                                                        {item.risk_level}
-                                                    </span>
-                                                </td>
-                                                <td>{(item.probability * 100).toFixed(1)}%</td>
-                                            </tr>
-                                        ))}
-                                    </tbody>
-                                </table>
-                            </div>
-                        </div>
-                    )}
-                </div>
-            );
-        }
-
-        function BodyVisualization({ age, weight, height, muac }) {
-            // WHO West Africa reference values for 60 months (5 years)
-            const REF_HEIGHT = 115;  // cm
-            const REF_WEIGHT = 20;   // kg
-            const REF_MUAC = 17;     // cm
-
-            // Calculate scale factors based on measurements vs reference
-            const scaleHeight = Math.max(0.4, Math.min(1.3, height / REF_HEIGHT));
-            const scaleWeight = Math.max(0.4, Math.min(1.3, weight / REF_WEIGHT));
-
-            // Body proportions (dynamic)
-            const headRadius = 14 * scaleHeight;
-            const limbLength = 28 * scaleHeight;
-            const centerX = 110;
-            const topY = 32 + (1 - scaleHeight) * 25;
-            const neckHeight = 6 * scaleHeight;
-            const shoulderWidth = 34 * scaleHeight;
-            const chestWidth = 28 * scaleHeight;
-            const waistWidth = 22 * scaleHeight;
-            const hipWidth = 30 * scaleHeight;
-            const torsoHeight = 40 * scaleHeight;
-            const armY = topY + headRadius + neckHeight + 6 * scaleHeight;
-            const torsoTopY = topY + headRadius + neckHeight;
-            const hipY = torsoTopY + torsoHeight;
-            const legStartY = hipY + 4 * scaleHeight;
-            const handRadius = 3.2 * scaleHeight;
-            const footWidth = 10 * scaleHeight;
-            const footHeight = 4.5 * scaleHeight;
-
-            // Determine body color based on MUAC (nutritional status)
-            const muacRatio = muac / REF_MUAC;
-            let healthColor, growthStatus;
-
-            if (muacRatio < 0.75) {
-                healthColor = '#ef4444';  // Red - severe
-                growthStatus = '🚨 Growth Deficit';
-            } else if (muacRatio < 0.9) {
-                healthColor = '#f59e0b';  // Orange - moderate
-                growthStatus = '⚠️ Monitor Growth';
-            } else {
-                healthColor = '#10b981';  // Green - normal
-                growthStatus = '✅ Normal Growth';
-            }
-
-            return (
-                <div id="bodyVisualization">
-                    <svg width="220" height="380" viewBox="0 0 220 380" style={{ margin: '0 auto' }}>
-                        {/* Defs for gradients */}
-                        <defs>
-                            <linearGradient id="bodyGrad" x1="0%" y1="0%" x2="100%" y2="100%">
-                                <stop offset="0%" style={{ stopColor: '#c7d2fe', stopOpacity: 1 }} />
-                                <stop offset="100%" style={{ stopColor: '#e0f2fe', stopOpacity: 1 }} />
-                            </linearGradient>
-                            <linearGradient id="torsoGrad" x1="0%" y1="0%" x2="0%" y2="100%">
-                                <stop offset="0%" style={{ stopColor: healthColor, stopOpacity: 0.95 }} />
-                                <stop offset="100%" style={{ stopColor: healthColor, stopOpacity: 0.6 }} />
-                            </linearGradient>
-                        </defs>
-
-                        {/* Head */}
-                        <circle
-                            cx={centerX}
-                            cy={topY}
-                            r={headRadius}
-                            fill="#e5e7eb"
-                            stroke="#1e40af"
-                            strokeWidth="2" />
-
-                        {/* Face details */}
-                        <circle cx={centerX - 4 * scaleHeight} cy={topY - 2 * scaleHeight} r={1.2 * scaleHeight} fill="#475569" />
-                        <circle cx={centerX + 4 * scaleHeight} cy={topY - 2 * scaleHeight} r={1.2 * scaleHeight} fill="#475569" />
-                        <path
-                            d={`M ${centerX - 4 * scaleHeight} ${topY + 4 * scaleHeight} Q ${centerX} ${topY + 6 * scaleHeight} ${centerX + 4 * scaleHeight} ${topY + 4 * scaleHeight}`}
-                            stroke="#475569"
-                            strokeWidth={1.4 * scaleHeight}
-                            fill="none"
-                            strokeLinecap="round"
-                        />
-
-                        {/* Neck */}
-                        <rect
-                            x={centerX - 4 * scaleHeight}
-                            y={topY + headRadius - 2 * scaleHeight}
-                            width={8 * scaleHeight}
-                            height={neckHeight}
-                            fill="#cbd5f5"
-                            stroke="#1e40af"
-                            strokeWidth="1"
-                            rx={2 * scaleHeight}
-                        />
-
-                        {/* Body - colored based on nutritional status */}
-                        <path
-                            d={`M ${centerX - shoulderWidth / 2} ${torsoTopY}
-                                L ${centerX + shoulderWidth / 2} ${torsoTopY}
-                                L ${centerX + chestWidth / 2} ${torsoTopY + torsoHeight * 0.45}
-                                L ${centerX + waistWidth / 2} ${torsoTopY + torsoHeight * 0.75}
-                                L ${centerX + hipWidth / 2} ${hipY}
-                                L ${centerX - hipWidth / 2} ${hipY}
-                                L ${centerX - waistWidth / 2} ${torsoTopY + torsoHeight * 0.75}
-                                L ${centerX - chestWidth / 2} ${torsoTopY + torsoHeight * 0.45}
-                                Z`}
-                            fill="url(#torsoGrad)"
-                            stroke="#0c4a6e"
-                            strokeWidth="2.2"
-                            opacity="0.9"
-                        />
-
-                        {/* Shoulder highlights */}
-                        <circle cx={centerX - shoulderWidth / 2} cy={armY} r={3 * scaleHeight} fill="#94a3b8" opacity="0.5" />
-                        <circle cx={centerX + shoulderWidth / 2} cy={armY} r={3 * scaleHeight} fill="#94a3b8" opacity="0.5" />
-
-                        {/* Left Arm (with MUAC indicator) */}
-                        <line
-                            x1={centerX - shoulderWidth / 2}
-                            y1={armY}
-                            x2={centerX - limbLength * 0.55}
-                            y2={armY + limbLength * 0.35}
-                            stroke="#475569"
-                            strokeWidth={2.5 + muacRatio * 3.5}
-                            strokeLinecap="round"
-                            opacity="0.85"
-                        />
-                        <line
-                            x1={centerX - limbLength * 0.55}
-                            y1={armY + limbLength * 0.35}
-                            x2={centerX - limbLength}
-                            y2={armY + limbLength * 0.65}
-                            stroke="#475569"
-                            strokeWidth={2.2 + muacRatio * 3.2}
-                            strokeLinecap="round"
-                            opacity="0.85"
-                        />
-                        <circle cx={centerX - limbLength} cy={armY + limbLength * 0.65} r={handRadius} fill="#94a3b8" />
-
-                        {/* Right Arm */}
-                        <line
-                            x1={centerX + shoulderWidth / 2}
-                            y1={armY}
-                            x2={centerX + limbLength * 0.55}
-                            y2={armY + limbLength * 0.35}
-                            stroke="#475569"
-                            strokeWidth={2.5 + muacRatio * 3.5}
-                            strokeLinecap="round"
-                            opacity="0.85"
-                        />
-                        <line
-                            x1={centerX + limbLength * 0.55}
-                            y1={armY + limbLength * 0.35}
-                            x2={centerX + limbLength}
-                            y2={armY + limbLength * 0.65}
-                            stroke="#475569"
-                            strokeWidth={2.2 + muacRatio * 3.2}
-                            strokeLinecap="round"
-                            opacity="0.85"
-                        />
-                        <circle cx={centerX + limbLength} cy={armY + limbLength * 0.65} r={handRadius} fill="#94a3b8" />
-
-                        {/* Left Leg */}
-                        <line
-                            x1={centerX - hipWidth * 0.25}
-                            y1={legStartY}
-                            x2={centerX - hipWidth * 0.3}
-                            y2={legStartY + limbLength * 0.6}
-                            stroke="#334155"
-                            strokeWidth={3 + scaleWeight * 2.5}
-                            strokeLinecap="round"
-                            opacity="0.85"
-                        />
-                        <line
-                            x1={centerX - hipWidth * 0.3}
-                            y1={legStartY + limbLength * 0.6}
-                            x2={centerX - hipWidth * 0.35}
-                            y2={legStartY + limbLength * 1.1}
-                            stroke="#334155"
-                            strokeWidth={2.8 + scaleWeight * 2.2}
-                            strokeLinecap="round"
-                            opacity="0.85"
-                        />
-                        <rect
-                            x={centerX - hipWidth * 0.35 - footWidth / 2}
-                            y={legStartY + limbLength * 1.1 - footHeight / 2}
-                            width={footWidth}
-                            height={footHeight}
-                            fill="#64748b"
-                            rx={2 * scaleHeight}
-                        />
-
-                        {/* Right Leg */}
-                        <line
-                            x1={centerX + hipWidth * 0.25}
-                            y1={legStartY}
-                            x2={centerX + hipWidth * 0.3}
-                            y2={legStartY + limbLength * 0.6}
-                            stroke="#334155"
-                            strokeWidth={3 + scaleWeight * 2.5}
-                            strokeLinecap="round"
-                            opacity="0.85"
-                        />
-                        <line
-                            x1={centerX + hipWidth * 0.3}
-                            y1={legStartY + limbLength * 0.6}
-                            x2={centerX + hipWidth * 0.35}
-                            y2={legStartY + limbLength * 1.1}
-                            stroke="#334155"
-                            strokeWidth={2.8 + scaleWeight * 2.2}
-                            strokeLinecap="round"
-                            opacity="0.85"
-                        />
-                        <rect
-                            x={centerX + hipWidth * 0.35 - footWidth / 2}
-                            y={legStartY + limbLength * 1.1 - footHeight / 2}
-                            width={footWidth}
-                            height={footHeight}
-                            fill="#64748b"
-                            rx={2 * scaleHeight}
-                        />
-
-                    </svg>
-
-                    {/* Growth status indicator */}
-                    <div className={`growth-indicator ${healthColor === '#ef4444' ? 'deficit' : healthColor === '#f59e0b' ? 'monitor' : 'normal'}`}>
-                        {growthStatus}
-                    </div>
-                </div>
-            );
-        }
-
-        ReactDOM.render(<App />, document.getElementById('root'));
-    </script>
-</body>
-
-</html>
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=True)
