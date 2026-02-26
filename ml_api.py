@@ -10,6 +10,7 @@ from models import train_evaluate, cross_validated_train, get_numeric_columns, p
 from data_utils import load_csv
 import joblib
 import os
+import json
 
 app = Flask(__name__)
 CORS(app)  # Enable CORS for React frontend
@@ -22,6 +23,39 @@ model_state = {
     'training_data': None,
     'feature_defaults': None
 }
+
+
+def load_pretrained_model():
+    """Load pre-trained model from disk if available."""
+    try:
+        model_path = 'models/pretrained_model.joblib'
+        metadata_path = 'models/model_metadata.json'
+        
+        if os.path.exists(model_path) and os.path.exists(metadata_path):
+            print("Loading pre-trained model from disk...")
+            model_state['model'] = joblib.load(model_path)
+            
+            with open(metadata_path, 'r') as f:
+                metadata = json.load(f)
+            
+            model_state['feature_cols'] = metadata['feature_cols']
+            model_state['feature_defaults'] = metadata['feature_defaults']
+            model_state['metrics'] = metadata['metrics']
+            
+            print(f"✅ Model loaded successfully!")
+            print(f"   - Features: {len(model_state['feature_cols'])}")
+            print(f"   - AUC: {model_state['metrics']['auc']:.4f}")
+            return True
+        else:
+            print("No pre-trained model found. Will need to train on first request.")
+            return False
+    except Exception as e:
+        print(f"Failed to load pre-trained model: {e}")
+        return False
+
+
+# Try to load pre-trained model on startup
+load_pretrained_model()
 
 
 def build_feature_defaults(df, feature_cols):
