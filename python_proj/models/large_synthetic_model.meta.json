@@ -1,0 +1,17 @@
+{
+  "model_file": "large_synthetic_model.joblib",
+  "feature_columns": [
+    "AG2",
+    "AN3",
+    "AN4",
+    "muac_cm",
+    "breastfeeding",
+    "recent_diarrhea",
+    "immunizations",
+    "household_income",
+    "maternal_education_years"
+  ],
+  "preprocessing": {
+    "generated": "synthetic_large"
+  }
+}
