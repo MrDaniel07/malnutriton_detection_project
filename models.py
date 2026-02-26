@@ -68,7 +68,7 @@ def train_evaluate(df, feature_cols=None, target_col="malnourished", C=1.0, test
 def predict_single(model, feature_cols, values_dict):
     """Predict probability for a single example given a dict of feature values."""
     x = np.array([values_dict.get(c, 0) for c in feature_cols]).reshape(1, -1)
-    prob = float(model.predict_proba(x)[:, 1])
+    prob = float(model.predict_proba(x)[0, 1])
     pred = int(model.predict(x)[0])
     return {"probability": prob, "prediction": pred}
 
