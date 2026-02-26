@@ -102,7 +102,13 @@ def health():
 def load_data():
     """Load training data (synthetic CSV or generate on-the-fly)."""
     try:
-        data_source = request.json.get('source', 'synthetic')
+        # Handle missing or invalid JSON
+        if not request.json:
+            data_source = 'synthetic'
+        else:
+            data_source = request.json.get('source', 'synthetic')
+        
+        print(f"Loading data with source: {data_source}")
         
         if data_source == 'synthetic':
             # Try loading CSV first, fallback to generating synthetic data
@@ -133,10 +139,17 @@ def load_data():
                 df['WHZ'] = (weights - expected_weight_for_height) / whz_sd
             
             # Compute any_mal if not present
-            if 'any_mal' not in df.columns and all(c in df.columns for c in ['WHZ', 'HAZ', 'WAZ']):
+            # First, check if we have 'malnourished' column from generation
+            if 'malnourished' in df.columns and 'any_mal' not in df.columns:
+                df['any_mal'] = df['malnourished']
+            elif 'any_mal' not in df.columns and all(c in df.columns for c in ['WHZ', 'HAZ', 'WAZ']):
                 df['any_mal'] = ((df['WHZ'] < -2) | (df['HAZ'] < -2) | (df['WAZ'] < -2)).astype(int)
             
             model_state['training_data'] = df
+            
+            print(f"Data loaded successfully: {len(df)} rows, {len(df.columns)} columns")
+            if 'any_mal' in df.columns:
+                print(f"Malnutrition cases: {df['any_mal'].sum()}")
             
             return jsonify({
                 'status': 'success',
@@ -146,7 +159,13 @@ def load_data():
             })
         else:
             return jsonify({'status': 'error', 'message': 'Invalid data source'}), 400
+    except FileNotFoundError as e:
+        print(f"FileNotFoundError in load_data: {e}")
+        return jsonify({'status': 'error', 'message': f'File not found: {str(e)}'}), 500
     except Exception as e:
+        print(f"Exception in load_data: {type(e).__name__}: {e}")
+        import traceback
+        traceback.print_exc()
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
 
