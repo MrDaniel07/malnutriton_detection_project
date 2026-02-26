@@ -100,12 +100,37 @@ def health():
 
 @app.route('/api/load-data', methods=['POST'])
 def load_data():
-    """Load training data (synthetic CSV)."""
+    """Load training data (synthetic CSV or generate on-the-fly)."""
     try:
         data_source = request.json.get('source', 'synthetic')
         
         if data_source == 'synthetic':
-            df = load_csv('csv_output/large_synthetic.csv')
+            # Try loading CSV first, fallback to generating synthetic data
+            try:
+                df = load_csv('csv_output/large_synthetic.csv')
+            except FileNotFoundError:
+                # Generate synthetic data if CSV doesn't exist (useful for cloud deployment)
+                print("CSV not found, generating synthetic data with 15000 samples...")
+                from data_utils import generate_synthetic_data
+                df = generate_synthetic_data(n_samples=15000, random_state=42)
+                
+                # Vectorized z-score computation for performance
+                ages = df['age_months'].values
+                weights = df['weight_kg'].values
+                heights = df['height_cm'].values
+                
+                # WHO West Africa reference values
+                expected_height = 48 + (ages * 1.12)
+                expected_weight = 3.5 + (ages * 0.28)
+                expected_weight_for_height = 3.5 + ((heights - 48) / 1.12) * 0.28
+                
+                height_sd = 6.0
+                weight_sd = 2.8
+                whz_sd = 2.5
+                
+                df['HAZ'] = (heights - expected_height) / height_sd
+                df['WAZ'] = (weights - expected_weight) / weight_sd
+                df['WHZ'] = (weights - expected_weight_for_height) / whz_sd
             
             # Compute any_mal if not present
             if 'any_mal' not in df.columns and all(c in df.columns for c in ['WHZ', 'HAZ', 'WAZ']):
