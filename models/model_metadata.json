@@ -1,0 +1,38 @@
+{
+  "feature_cols": [
+    "age_months",
+    "weight_kg",
+    "height_cm",
+    "muac_cm",
+    "breastfeeding",
+    "recent_diarrhea",
+    "immunizations",
+    "household_income",
+    "maternal_education_years",
+    "malnourished",
+    "HAZ",
+    "WAZ",
+    "WHZ"
+  ],
+  "feature_defaults": {
+    "age_months": 29.5594,
+    "weight_kg": 15.904354330340649,
+    "height_cm": 107.98107273160251,
+    "muac_cm": 13.591341511862186,
+    "breastfeeding": 0.6031333333333333,
+    "recent_diarrhea": 0.09513333333333333,
+    "immunizations": 3.4759333333333333,
+    "household_income": 50753.63430900292,
+    "maternal_education_years": 7.507666666666666,
+    "malnourished": 0.0154,
+    "HAZ": 4.479090788600415,
+    "WAZ": 1.4741865465502308,
+    "WHZ": -1.036365541023991
+  },
+  "metrics": {
+    "auc": 1.0,
+    "auc_std": 0.0,
+    "num_features": 13,
+    "training_samples": 15000
+  }
+}
