@@ -1115,32 +1115,7 @@
 
         function BodyVisualization({ age, weight, height, muac }) {
             // WHO West Africa reference values for 60 months (5 years)
-            const REF_HEIGHT = 115;  // cm
-            const REF_WEIGHT = 20;   // kg
             const REF_MUAC = 17;     // cm
-
-            // Calculate scale factors based on measurements vs reference
-            const scaleHeight = Math.max(0.4, Math.min(1.3, height / REF_HEIGHT));
-            const scaleWeight = Math.max(0.4, Math.min(1.3, weight / REF_WEIGHT));
-
-            // Body proportions (dynamic)
-            const headRadius = 14 * scaleHeight;
-            const limbLength = 28 * scaleHeight;
-            const centerX = 110;
-            const topY = 32 + (1 - scaleHeight) * 25;
-            const neckHeight = 6 * scaleHeight;
-            const shoulderWidth = 34 * scaleHeight;
-            const chestWidth = 28 * scaleHeight;
-            const waistWidth = 22 * scaleHeight;
-            const hipWidth = 30 * scaleHeight;
-            const torsoHeight = 40 * scaleHeight;
-            const armY = topY + headRadius + neckHeight + 6 * scaleHeight;
-            const torsoTopY = topY + headRadius + neckHeight;
-            const hipY = torsoTopY + torsoHeight;
-            const legStartY = hipY + 4 * scaleHeight;
-            const handRadius = 3.2 * scaleHeight;
-            const footWidth = 10 * scaleHeight;
-            const footHeight = 4.5 * scaleHeight;
 
             // Determine body color based on MUAC (nutritional status)
             const muacRatio = muac / REF_MUAC;
@@ -1148,192 +1123,50 @@
 
             if (muacRatio < 0.75) {
                 healthColor = '#ef4444';  // Red - severe
-                growthStatus = '🚨 Growth Deficit';
+                growthStatus = 'Growth Deficit';
             } else if (muacRatio < 0.9) {
                 healthColor = '#f59e0b';  // Orange - moderate
-                growthStatus = '⚠️ Monitor Growth';
+                growthStatus = 'Monitor Growth';
             } else {
                 healthColor = '#10b981';  // Green - normal
-                growthStatus = '✅ Normal Growth';
+                growthStatus = 'Normal Growth';
             }
 
             return (
                 <div id="bodyVisualization">
                     <svg width="220" height="380" viewBox="0 0 220 380" style={{ margin: '0 auto' }}>
-                        {/* Defs for gradients */}
-                        <defs>
-                            <linearGradient id="bodyGrad" x1="0%" y1="0%" x2="100%" y2="100%">
-                                <stop offset="0%" style={{ stopColor: '#c7d2fe', stopOpacity: 1 }} />
-                                <stop offset="100%" style={{ stopColor: '#e0f2fe', stopOpacity: 1 }} />
-                            </linearGradient>
-                            <linearGradient id="torsoGrad" x1="0%" y1="0%" x2="0%" y2="100%">
-                                <stop offset="0%" style={{ stopColor: healthColor, stopOpacity: 0.95 }} />
-                                <stop offset="100%" style={{ stopColor: healthColor, stopOpacity: 0.6 }} />
-                            </linearGradient>
-                        </defs>
-
+                        {/* Simple child silhouette figure */}
                         {/* Head */}
-                        <circle
-                            cx={centerX}
-                            cy={topY}
-                            r={headRadius}
-                            fill="#e5e7eb"
-                            stroke="#1e40af"
-                            strokeWidth="2" />
-
-                        {/* Face details */}
-                        <circle cx={centerX - 4 * scaleHeight} cy={topY - 2 * scaleHeight} r={1.2 * scaleHeight} fill="#475569" />
-                        <circle cx={centerX + 4 * scaleHeight} cy={topY - 2 * scaleHeight} r={1.2 * scaleHeight} fill="#475569" />
-                        <path
-                            d={`M ${centerX - 4 * scaleHeight} ${topY + 4 * scaleHeight} Q ${centerX} ${topY + 6 * scaleHeight} ${centerX + 4 * scaleHeight} ${topY + 4 * scaleHeight}`}
-                            stroke="#475569"
-                            strokeWidth={1.4 * scaleHeight}
-                            fill="none"
-                            strokeLinecap="round"
-                        />
+                        <circle cx="110" cy="50" r="18" fill={healthColor} />
 
                         {/* Neck */}
-                        <rect
-                            x={centerX - 4 * scaleHeight}
-                            y={topY + headRadius - 2 * scaleHeight}
-                            width={8 * scaleHeight}
-                            height={neckHeight}
-                            fill="#cbd5f5"
-                            stroke="#1e40af"
-                            strokeWidth="1"
-                            rx={2 * scaleHeight}
-                        />
+                        <line x1="110" y1="68" x2="110" y2="85" stroke={healthColor} strokeWidth="8" />
 
-                        {/* Body - colored based on nutritional status */}
-                        <path
-                            d={`M ${centerX - shoulderWidth / 2} ${torsoTopY}
-                                L ${centerX + shoulderWidth / 2} ${torsoTopY}
-                                L ${centerX + chestWidth / 2} ${torsoTopY + torsoHeight * 0.45}
-                                L ${centerX + waistWidth / 2} ${torsoTopY + torsoHeight * 0.75}
-                                L ${centerX + hipWidth / 2} ${hipY}
-                                L ${centerX - hipWidth / 2} ${hipY}
-                                L ${centerX - waistWidth / 2} ${torsoTopY + torsoHeight * 0.75}
-                                L ${centerX - chestWidth / 2} ${torsoTopY + torsoHeight * 0.45}
-                                Z`}
-                            fill="url(#torsoGrad)"
-                            stroke="#0c4a6e"
-                            strokeWidth="2.2"
-                            opacity="0.9"
-                        />
+                        {/* Torso */}
+                        <rect x="85" y="85" width="50" height="80" fill={healthColor} rx="8" />
 
-                        {/* Shoulder highlights */}
-                        <circle cx={centerX - shoulderWidth / 2} cy={armY} r={3 * scaleHeight} fill="#94a3b8" opacity="0.5" />
-                        <circle cx={centerX + shoulderWidth / 2} cy={armY} r={3 * scaleHeight} fill="#94a3b8" opacity="0.5" />
-
-                        {/* Left Arm (with MUAC indicator) */}
-                        <line
-                            x1={centerX - shoulderWidth / 2}
-                            y1={armY}
-                            x2={centerX - limbLength * 0.55}
-                            y2={armY + limbLength * 0.35}
-                            stroke="#475569"
-                            strokeWidth={2.5 + muacRatio * 3.5}
-                            strokeLinecap="round"
-                            opacity="0.85"
-                        />
-                        <line
-                            x1={centerX - limbLength * 0.55}
-                            y1={armY + limbLength * 0.35}
-                            x2={centerX - limbLength}
-                            y2={armY + limbLength * 0.65}
-                            stroke="#475569"
-                            strokeWidth={2.2 + muacRatio * 3.2}
-                            strokeLinecap="round"
-                            opacity="0.85"
-                        />
-                        <circle cx={centerX - limbLength} cy={armY + limbLength * 0.65} r={handRadius} fill="#94a3b8" />
+                        {/* Left Arm */}
+                        <line x1="85" y1="100" x2="40" y2="140" stroke={healthColor} strokeWidth="12" strokeLinecap="round" />
+                        {/* Left Hand */}
+                        <circle cx="40" cy="140" r="8" fill={healthColor} />
 
                         {/* Right Arm */}
-                        <line
-                            x1={centerX + shoulderWidth / 2}
-                            y1={armY}
-                            x2={centerX + limbLength * 0.55}
-                            y2={armY + limbLength * 0.35}
-                            stroke="#475569"
-                            strokeWidth={2.5 + muacRatio * 3.5}
-                            strokeLinecap="round"
-                            opacity="0.85"
-                        />
-                        <line
-                            x1={centerX + limbLength * 0.55}
-                            y1={armY + limbLength * 0.35}
-                            x2={centerX + limbLength}
-                            y2={armY + limbLength * 0.65}
-                            stroke="#475569"
-                            strokeWidth={2.2 + muacRatio * 3.2}
-                            strokeLinecap="round"
-                            opacity="0.85"
-                        />
-                        <circle cx={centerX + limbLength} cy={armY + limbLength * 0.65} r={handRadius} fill="#94a3b8" />
+                        <line x1="135" y1="100" x2="180" y2="140" stroke={healthColor} strokeWidth="12" strokeLinecap="round" />
+                        {/* Right Hand */}
+                        <circle cx="180" cy="140" r="8" fill={healthColor} />
 
                         {/* Left Leg */}
-                        <line
-                            x1={centerX - hipWidth * 0.25}
-                            y1={legStartY}
-                            x2={centerX - hipWidth * 0.3}
-                            y2={legStartY + limbLength * 0.6}
-                            stroke="#334155"
-                            strokeWidth={3 + scaleWeight * 2.5}
-                            strokeLinecap="round"
-                            opacity="0.85"
-                        />
-                        <line
-                            x1={centerX - hipWidth * 0.3}
-                            y1={legStartY + limbLength * 0.6}
-                            x2={centerX - hipWidth * 0.35}
-                            y2={legStartY + limbLength * 1.1}
-                            stroke="#334155"
-                            strokeWidth={2.8 + scaleWeight * 2.2}
-                            strokeLinecap="round"
-                            opacity="0.85"
-                        />
-                        <rect
-                            x={centerX - hipWidth * 0.35 - footWidth / 2}
-                            y={legStartY + limbLength * 1.1 - footHeight / 2}
-                            width={footWidth}
-                            height={footHeight}
-                            fill="#64748b"
-                            rx={2 * scaleHeight}
-                        />
+                        <line x1="92" y1="165" x2="85" y2="280" stroke={healthColor} strokeWidth="14" strokeLinecap="round" />
+                        {/* Left Foot */}
+                        <rect x="75" y="280" width="20" height="12" fill={healthColor} rx="6" />
 
                         {/* Right Leg */}
-                        <line
-                            x1={centerX + hipWidth * 0.25}
-                            y1={legStartY}
-                            x2={centerX + hipWidth * 0.3}
-                            y2={legStartY + limbLength * 0.6}
-                            stroke="#334155"
-                            strokeWidth={3 + scaleWeight * 2.5}
-                            strokeLinecap="round"
-                            opacity="0.85"
-                        />
-                        <line
-                            x1={centerX + hipWidth * 0.3}
-                            y1={legStartY + limbLength * 0.6}
-                            x2={centerX + hipWidth * 0.35}
-                            y2={legStartY + limbLength * 1.1}
-                            stroke="#334155"
-                            strokeWidth={2.8 + scaleWeight * 2.2}
-                            strokeLinecap="round"
-                            opacity="0.85"
-                        />
-                        <rect
-                            x={centerX + hipWidth * 0.35 - footWidth / 2}
-                            y={legStartY + limbLength * 1.1 - footHeight / 2}
-                            width={footWidth}
-                            height={footHeight}
-                            fill="#64748b"
-                            rx={2 * scaleHeight}
-                        />
-
+                        <line x1="128" y1="165" x2="135" y2="280" stroke={healthColor} strokeWidth="14" strokeLinecap="round" />
+                        {/* Right Foot */}
+                        <rect x="135" y="280" width="20" height="12" fill={healthColor} rx="6" />
                     </svg>
 
-                    {/* Growth status indicator */}
+                    {/* Growth status indicator - updated text without emoji */}
                     <div className={`growth-indicator ${healthColor === '#ef4444' ? 'deficit' : healthColor === '#f59e0b' ? 'monitor' : 'normal'}`}>
                         {growthStatus}
                     </div>
