@@ -1134,36 +1134,9 @@
 
             return (
                 <div id="bodyVisualization">
-                    <svg width="220" height="380" viewBox="0 0 220 380" style={{ margin: '0 auto' }}>
-                        {/* Simple child silhouette figure */}
-                        {/* Head */}
-                        <circle cx="110" cy="50" r="18" fill={healthColor} />
-
-                        {/* Neck */}
-                        <line x1="110" y1="68" x2="110" y2="85" stroke={healthColor} strokeWidth="8" />
-
-                        {/* Torso */}
-                        <rect x="85" y="85" width="50" height="80" fill={healthColor} rx="8" />
-
-                        {/* Left Arm */}
-                        <line x1="85" y1="100" x2="40" y2="140" stroke={healthColor} strokeWidth="12" strokeLinecap="round" />
-                        {/* Left Hand */}
-                        <circle cx="40" cy="140" r="8" fill={healthColor} />
-
-                        {/* Right Arm */}
-                        <line x1="135" y1="100" x2="180" y2="140" stroke={healthColor} strokeWidth="12" strokeLinecap="round" />
-                        {/* Right Hand */}
-                        <circle cx="180" cy="140" r="8" fill={healthColor} />
-
-                        {/* Left Leg */}
-                        <line x1="92" y1="165" x2="85" y2="280" stroke={healthColor} strokeWidth="14" strokeLinecap="round" />
-                        {/* Left Foot */}
-                        <rect x="75" y="280" width="20" height="12" fill={healthColor} rx="6" />
-
-                        {/* Right Leg */}
-                        <line x1="128" y1="165" x2="135" y2="280" stroke={healthColor} strokeWidth="14" strokeLinecap="round" />
-                        {/* Right Foot */}
-                        <rect x="135" y="280" width="20" height="12" fill={healthColor} rx="6" />
+                    <svg width="260" height="320" viewBox="0 0 576 329" preserveAspectRatio="xMidYMid meet" style={{ margin: '0 auto', display: 'block' }}>
+                        <image href="model.png" x="0" y="0" width="576" height="329" preserveAspectRatio="xMidYMid meet" />
+                        <rect x="0" y="0" width="576" height="329" fill={healthColor} opacity="0.45" style={{ mixBlendMode: 'multiply' }} />
                     </svg>
 
                     {/* Growth status indicator - updated text without emoji */}
