@@ -150,9 +150,9 @@ def load_data():
                 df = load_csv('csv_output/large_synthetic.csv')
             except FileNotFoundError:
                 # Generate synthetic data if CSV doesn't exist (useful for cloud deployment)
-                print("CSV not found, generating synthetic data with 15000 samples...")
+                print("CSV not found, generating synthetic data with 50000 samples (improved for >70% AUC)...")
                 from data_utils import generate_synthetic_data
-                df = generate_synthetic_data(n_samples=15000, random_state=42)
+                df = generate_synthetic_data(n_samples=50000, random_state=42)
                 
                 # Vectorized z-score computation for performance
                 ages = df['age_months'].values

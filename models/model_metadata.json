@@ -14,23 +14,23 @@
     "WHZ"
   ],
   "feature_defaults": {
-    "age_months": 29.5594,
-    "weight_kg": 15.904354330340649,
-    "height_cm": 107.98107273160251,
-    "muac_cm": 13.591341511862186,
-    "breastfeeding": 0.6031333333333333,
-    "recent_diarrhea": 0.09513333333333333,
-    "immunizations": 3.4759333333333333,
-    "household_income": 50753.63430900292,
-    "maternal_education_years": 7.507666666666666,
-    "HAZ": 4.479090788600415,
-    "WAZ": 1.4741865465502308,
-    "WHZ": -1.036365541023991
+    "age_months": 29.53528,
+    "weight_kg": 15.906764072431487,
+    "height_cm": 107.9714549047102,
+    "muac_cm": 13.601032047395382,
+    "breastfeeding": 0.60014,
+    "recent_diarrhea": 0.09924,
+    "immunizations": 3.51614,
+    "household_income": 50502.53953575505,
+    "maternal_education_years": 7.50158,
+    "HAZ": 4.481990217451695,
+    "WAZ": 1.4774591687255305,
+    "WHZ": -1.0344398614984232
   },
   "metrics": {
-    "auc": 0.6901602674857401,
-    "auc_std": 0.052929707945450745,
+    "auc": 0.7035477805204543,
+    "auc_std": 0.025647105101462904,
     "num_features": 12,
-    "training_samples": 15000
+    "training_samples": 50000
   }
 }

@@ -12,8 +12,8 @@ import json
 
 
 def train_and_save():
-    print("Generating synthetic training data (15,000 samples)...")
-    df = generate_synthetic_data(n_samples=15000, random_state=42)
+    print("Generating synthetic training data (50,000 samples for >70% AUC)...")
+    df = generate_synthetic_data(n_samples=50000, random_state=42)
     
     # Add z-scores (vectorized for performance)
     print("Computing z-scores...")
